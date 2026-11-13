@@ -91,7 +91,7 @@ report(before.stale === false, 'a freshly loaded module is not stale')
 
 // Simulate an edit: bump the version constant the way a real change would.
 const original = await readFile(target, 'utf8')
-await writeFile(target, original.replace("const VERSION = '1.2.0'", "const VERSION = '9.9.9-reloaded'"), 'utf8')
+await writeFile(target, original.replace(/const VERSION = '[^']*'/, "const VERSION = '9.9.9-reloaded'"), 'utf8')
 
 const deadline = Date.now() + 8000
 let after = null

@@ -4,7 +4,8 @@
 
 > Adds a permanent **Delete session** action right after **Archive session** in the session context menu, and removes every artifact the Host keeps for that Session. MIT licensed.
 
-- 版本：1.2.0
+- 版本：1.2.1
+- 分发：GitHub 仓库 + Release 里的 zip/tgz（未发布到 npm：npm 上 `dsh-session-delete` 已被他人占用，且发布需要账号 2FA）
 - 宿主侧提供同名 Agent 工具 `session_delete({ sessionId, dryRun })` 与 HTTP 接口，浏览器里点右键菜单和 Agent 调用走同一套删除实现。
 - 删除后宿主广播 `api-session/removed`，侧栏那一行立即消失，无需刷新。
 - 共享附件（`attachments/v1/objects/<sha>`）按内容寻址、多会话共用，**刻意不删**。

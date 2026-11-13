@@ -16,7 +16,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 export const name = 'dsh-session-delete'
 export const inject = ['webServer', 'tools']
 
-export const VERSION = '1.2.0'
+export const VERSION = '1.2.1'
 const ROUTE = '/session-delete'
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
 const MAX_BODY_BYTES = 64 * 1024
