@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Session Delete",
+    "description": "Adds a permanent \"Delete session\" action after \"Archive session\" that removes the session log, rewind snapshots, projection cache and workspace records."
+  }
+}

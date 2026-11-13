@@ -1,0 +1,59 @@
+{
+  "name": "dsh-session-delete",
+  "version": "1.2.0",
+  "type": "module",
+  "description": "DeepSeek Harness plugin: adds a permanent \"Delete session\" action after \"Archive session\", removing every artifact the Host stores for that session.",
+  "license": "MIT",
+  "author": "LIQiang-IT",
+  "homepage": "https://github.com/LIQiang-IT/dsh-session-delete#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LIQiang-IT/dsh-session-delete.git"
+  },
+  "bugs": {
+    "url": "https://github.com/LIQiang-IT/dsh-session-delete/issues"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "dsh-plugin",
+    "session",
+    "delete",
+    "session-manager"
+  ],
+  "engines": {
+    "node": ">=22.5"
+  },
+  "scripts": {
+    "test": "node tests/delete-session.test.mjs && node tests/reload.test.mjs"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "README.md",
+    "LICENSE",
+    "locale"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-context-menu"
+      ]
+    }
+  },
+  "manifestVersion": 1
+}
