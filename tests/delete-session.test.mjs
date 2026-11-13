@@ -5,7 +5,7 @@
 import { mkdtemp, mkdir, writeFile, readdir, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { deleteSession } from '../index.js'
+import { admitRequest, deleteSession } from '../index.js'
 
 const sessions = new Set()
 const unarchived = []
@@ -183,6 +183,17 @@ report(await countOne('usage.sqlite', 'calls', 'session', keep) === 1, 'kept the
 // 5. Second deletion of the same id is a clean no-op.
 const again = await deleteSession(ctx, id, {})
 report(again.removed.length === 0 && again.failed.length === 0, 'repeat deletion is a no-op', JSON.stringify(again.notes))
+
+// 6. Admission fence: the Host's check wins; without that service, cross-site is refused.
+const headersOf = (extra) => ({ headers: extra })
+const noFence = { get: () => undefined }
+report(admitRequest(noFence, headersOf({})) === undefined, 'admission: plain request without a Host fence is allowed')
+report(admitRequest({ get: () => ({ requestRejection: () => 'nope' }) }, headersOf({})) === 'nope', 'admission: the Host fence answer is used verbatim')
+report(admitRequest(noFence, headersOf({ 'sec-fetch-site': 'cross-site' })) !== undefined, 'admission: cross-site browser request is refused')
+report(admitRequest(noFence, headersOf({ 'sec-fetch-site': 'same-origin' })) === undefined, 'admission: same-origin browser request is allowed')
+report(admitRequest(noFence, headersOf({ origin: 'http://127.0.0.1:58663', host: '127.0.0.1:58663' })) === undefined, 'admission: matching Origin/Host is allowed')
+report(admitRequest(noFence, headersOf({ origin: 'https://evil.example', host: '127.0.0.1:58663' })) !== undefined, 'admission: foreign Origin is refused')
+report(admitRequest(noFence, headersOf({ origin: 'null' })) === undefined, 'admission: opaque Origin is left to the Host fence')
 
 console.log(`\nscratch home: ${home}`)
 console.log(`remaining sessions: ${JSON.stringify(await readdir(join(home, 'sessions')))}`)

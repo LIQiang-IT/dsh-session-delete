@@ -4,7 +4,7 @@
 
 > Adds a permanent **Delete session** action right after **Archive session** in the session context menu, and removes every artifact the Host keeps for that Session. MIT licensed.
 
-- 版本：1.2.1
+- 版本：1.2.2
 - 分发：GitHub 仓库 + Release 里的 zip/tgz（未发布到 npm：npm 上 `dsh-session-delete` 已被他人占用，且发布需要账号 2FA）
 - 宿主侧提供同名 Agent 工具 `session_delete({ sessionId, dryRun })` 与 HTTP 接口，浏览器里点右键菜单和 Agent 调用走同一套删除实现。
 - 删除后宿主广播 `api-session/removed`，侧栏那一行立即消失，无需刷新。
@@ -34,7 +34,7 @@
 - 侧栏会话行右键 → **删除会话**（危险色，位于“归档会话”之后）→ 确认弹窗显示会话标题，执行后列出删除的路径与字节数、被删的定时任务、被清理的索引行数、失败项、备注。
 - 删除成功后宿主广播 `api-session/removed`，侧栏那一行**立即消失**，不需要刷新页面（客户端同时调用 `sessions.handleSessionRemoved()` + `sessions.refresh()` 兜底）。
 - Agent 工具 `session_delete({ sessionId, dryRun })`：同一套逻辑，`dryRun=true` 只列出将被删除的路径、任务与索引行数。
-- HTTP（客户端走这条通道，带 `connection.requestRejection` 请求栅栏）：
+- HTTP（客户端走这条通道，带 `connection.requestRejection` 请求栅栏；Host 没有该服务时退化为 `Sec-Fetch-Site` + `Origin`/`Host` 同源校验）：
   - `GET /session-delete/api/health` —— 宿主半的加载状态（见下）
   - `GET /session-delete/api/preview?sessionId=...`
   - `POST /session-delete/api/delete` `{ "sessionId": "...", "dryRun": false }`

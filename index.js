@@ -16,7 +16,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 export const name = 'dsh-session-delete'
 export const inject = ['webServer', 'tools']
 
-export const VERSION = '1.2.1'
+export const VERSION = '1.2.2'
 const ROUTE = '/session-delete'
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
 const MAX_BODY_BYTES = 64 * 1024
@@ -428,11 +428,39 @@ async function readJson(request) {
 	}
 }
 
+/**
+ * Admission fence for the HTTP route.
+ *
+ * The Host's own connection service answers this for its built-in API: it rejects
+ * requests a browser page on another site could have forged. When a Host is
+ * composed without that service, fall back to a strict same-origin check so the
+ * delete route never becomes a cross-site target by default.
+ */
+export function admitRequest(ctx, request) {
+	const connection = ctx?.get?.('connection')
+	if (typeof connection?.requestRejection === 'function') return connection.requestRejection(request)
+	const headers = request?.headers ?? {}
+	const site = headers['sec-fetch-site']
+	if (typeof site === 'string' && site !== 'same-origin' && site !== 'none') return 'cross-site request'
+	const origin = headers.origin
+	if (typeof origin === 'string' && origin !== '' && origin !== 'null') {
+		let originHost = null
+		try {
+			originHost = new URL(origin).host
+		} catch {
+			return 'malformed Origin'
+		}
+		const host = headers.host
+		if (typeof host === 'string' && host !== '' && originHost !== host) return 'cross-origin request'
+	}
+	return undefined
+}
+
 function createHandler(ctx, status) {
 	return async (request, response) => {
 		try {
 			// Admit only requests the Harness itself would serve to its own page.
-			const rejection = ctx.get('connection')?.requestRejection?.(request)
+			const rejection = admitRequest(ctx, request)
 			if (rejection !== undefined) {
 				sendJson(response, 403, { error: 'forbidden' })
 				return
