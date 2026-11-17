@@ -33,8 +33,14 @@ window.__ModuleLoader__.load({
 				'dialog.scheduleDeleted': '已删除指向它的定时任务：{title}',
 				'dialog.indexPurged': '已从 {store} 索引清理 {count} 行',
 				'dialog.hostStale': '宿主插件仍在跑旧代码（{reason}）。重启 DSH 前，这里的删除行为可能与源码不一致。',
-				'dialog.tombstone': '已在归档中留下隐藏标记：宿主重启前它仍把该会话留在内存目录里，这一标记可确保侧栏不再把它显示为“未分组”。',
+				'dialog.hidden': '已把它挡在侧栏目录之外：宿主重启前该会话仍驻留内存，插件会持续把它从列表里剔除。',
+				'dialog.unarchived': '顺带清理了 1.2.3 留下的归档标记：{ids}',
 				'dialog.close': '关闭',
+				'menu.diagnose': '诊断会话目录',
+				'diag.title': '会话目录诊断',
+				'diag.intro': '下面是客户端此刻持有的会话目录与工作区快照，用来定位“未分组”里多出来的行。只读，不会改动任何数据。',
+				'diag.refresh': '重新读取',
+				'diag.close': '关闭',
 			},
 			en: {
 				'menu.deleteSession': 'Delete session',
@@ -51,8 +57,14 @@ window.__ModuleLoader__.load({
 				'dialog.scheduleDeleted': 'Deleted the scheduled task aimed at it: {title}',
 				'dialog.indexPurged': 'Removed {count} row(s) from the {store} index',
 				'dialog.hostStale': 'The Host plugin is still running older code ({reason}). Until DSH restarts, this delete may not match the sources on disk.',
-				'dialog.tombstone': 'Left a hidden archived marker: until the Host restarts it still lists this Session in memory, and the marker keeps the sidebar from filing it under "Ungrouped".',
+				'dialog.hidden': 'Kept out of the sidebar catalog: until the Host restarts it still holds this Session in memory, and the plugin keeps dropping the row from the list.',
+				'dialog.unarchived': 'Also cleared the archive marker that 1.2.3 left behind: {ids}',
 				'dialog.close': 'Close',
+				'menu.diagnose': 'Diagnose session catalog',
+				'diag.title': 'Session catalog diagnosis',
+				'diag.intro': 'The Session catalog and Workspace snapshot this browser holds right now, for tracking down extra "Ungrouped" rows. Read-only; nothing changes.',
+				'diag.refresh': 'Read again',
+				'diag.close': 'Close',
 			},
 		}
 
@@ -199,37 +211,175 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
-		 * Drop the deleted Session from the live catalog row set.
+		 * The Host cannot evict a Session that is still resident in memory, so a
+		 * deleted Session keeps showing up in `session.list` until DSH restarts.
+		 * The Host therefore records every delete in a tombstone file, and this
+		 * browser half keeps those rows out of the catalog.
 		 *
-		 * Order matters: `ClientSessions.refresh()` resets the mutation log
-		 * (`this.listMutations = mutations`) before it re-baselines from
-		 * `session.list`, so a removal recorded *before* the refresh is thrown
-		 * away and the Host's baseline puts the row back. The Host keeps the
-		 * Session resident until it restarts, so that resurrected row has no
-		 * workspace membership left and the sidebar files it under "未分组".
-		 *
-		 * Therefore: remove immediately (no flicker), refresh, then remove
-		 * again so the removal lands on top of the new baseline.
+		 * One removal is not enough: `ClientSessions.refresh()` resets its
+		 * mutation log (`this.listMutations = mutations`) before it re-baselines
+		 * from `session.list`, so the row returns after a page reload, a
+		 * reconnect, or any Host push. Re-dropping on every catalog update is
+		 * what makes the row stay gone.
 		 */
-		function reconcileCatalog(ctx, sessionId) {
+		const TOMBSTONE_ENDPOINT = 'session-delete/api/tombstones'
+		let tombstoned = new Set()
+		let tombstoneGuard = null
+
+		async function requestTombstones() {
+			const response = await fetch(new URL(TOMBSTONE_ENDPOINT, document.baseURI).href, { cache: 'no-store' })
+			if (!response.ok) throw new Error(`HTTP ${response.status}`)
+			const payload = await response.json()
+			const ids = Array.isArray(payload && payload.ids) ? payload.ids.filter((id) => typeof id === 'string') : []
+			const unarchived = Array.isArray(payload && payload.unarchived) ? payload.unarchived.filter((id) => typeof id === 'string') : []
+			return { ids, unarchived }
+		}
+
+		/** Remove one row from the live catalog, if the row is still there. */
+		function dropCatalogRow(ctx, sessionId) {
 			const sessions = ctx.get('sessions')
-			if (!sessions || typeof sessions !== 'object') return
-			const drop = () => {
-				try {
-					if (typeof sessions.handleSessionRemoved === 'function') sessions.handleSessionRemoved(sessionId)
-				} catch (error) {
-					console.error('dsh-session-delete: handleSessionRemoved failed', error)
-				}
-			}
-			drop()
-			let pending
+			if (!sessions || typeof sessions.handleSessionRemoved !== 'function') return false
+			const snapshot = snapshotOf(sessions.list)
+			if (snapshot !== undefined && snapshot.byId !== undefined && snapshot.byId[sessionId] === undefined) return false
 			try {
-				pending = typeof sessions.refresh === 'function' ? sessions.refresh() : undefined
+				sessions.handleSessionRemoved(sessionId)
+				return true
 			} catch (error) {
-				console.error('dsh-session-delete: list refresh failed', error)
-				return
+				console.error('dsh-session-delete: handleSessionRemoved failed', error)
+				return false
 			}
-			if (pending && typeof pending.then === 'function') pending.then(drop, drop)
+		}
+
+		/** Re-drop tombstoned rows whenever the catalog changes. */
+		function installCatalogGuard(ctx) {
+			if (tombstoneGuard !== null) return tombstoneGuard
+			const guard = { installed: false, timer: null }
+			tombstoneGuard = guard
+			const sessions = ctx.get('sessions')
+			const store = sessions === undefined ? undefined : sessions.list
+			if (store === undefined || typeof store.subscribe !== 'function') return guard
+			guard.installed = true
+			store.subscribe(() => {
+				if (guard.timer !== null) return
+				// Sweep after the store settles: handleSessionRemoved writes it too.
+				guard.timer = setTimeout(() => {
+					guard.timer = null
+					for (const id of tombstoned) dropCatalogRow(ctx, id)
+				}, 0)
+			})
+			return guard
+		}
+
+		/** Read the Host tombstone list, then drop every row it names. */
+		async function refreshTombstones(ctx) {
+			try {
+				const { ids, unarchived } = await requestTombstones()
+				tombstoned = new Set(ids)
+				installCatalogGuard(ctx)
+				for (const id of ids) dropCatalogRow(ctx, id)
+				return { ids, unarchived }
+			} catch (error) {
+				console.error('dsh-session-delete: tombstone fetch failed', error)
+				return { ids: [], unarchived: [] }
+			}
+		}
+
+		/** Right after a delete: forget the row locally and sync with the Host list. */
+		function rememberDeleted(ctx, sessionId) {
+			tombstoned.add(sessionId)
+			installCatalogGuard(ctx)
+			dropCatalogRow(ctx, sessionId)
+			return refreshTombstones(ctx)
+		}
+
+		let pendingDiagnosis = null
+		const diagnosisListeners = new Set()
+
+		function publishDiagnosis(next) {
+			pendingDiagnosis = next
+			for (const listener of diagnosisListeners) listener()
+		}
+
+		function useDiagnosis() {
+			const [request, setRequest] = React.useState(pendingDiagnosis)
+			React.useEffect(() => {
+				const listener = () => setRequest(pendingDiagnosis)
+				diagnosisListeners.add(listener)
+				return () => { diagnosisListeners.delete(listener) }
+			}, [])
+			return request
+		}
+
+		function snapshotOf(source) {
+			try {
+				if (source === undefined || source === null || typeof source.getSnapshot !== 'function') return undefined
+				return source.getSnapshot()
+			} catch (error) {
+				console.error('dsh-session-delete: snapshot read failed', error)
+				return undefined
+			}
+		}
+
+		function summaryLine(summary) {
+			if (summary === undefined || summary === null) return 'summary=missing'
+			return 'title=' + String(summary.displayTitle ?? summary.title ?? '?')
+				+ ' blank=' + String(summary.blank === true)
+				+ ' origin=' + String(summary.origin ?? 'user')
+				+ ' cwd=' + String(summary.cwd ?? '-')
+		}
+
+		/**
+		 * Read-only dump of the two client snapshots the sidebar composes from.
+		 *
+		 * The sidebar derives a row's group by "is any Workspace accounting for
+		 * this id", and hides rows whose id is in the registry archive set. A row
+		 * that shows under "未分组" therefore has an id absent from
+		 * `workspaces.list.archivedSessionIds` — this dump makes that visible.
+		 */
+		function buildDiagnostics(ctx, sessionId) {
+			const lines = []
+			const sessions = ctx.get('sessions')
+			const workspaces = ctx.get('workspaces')
+			const list = sessions === undefined ? undefined : snapshotOf(sessions.list)
+			const views = workspaces === undefined ? undefined : snapshotOf(workspaces.list)
+			const ids = list !== undefined && Array.isArray(list.ids) ? list.ids : []
+			const byId = list !== undefined && list.byId !== null && typeof list.byId === 'object' ? list.byId : {}
+			const items = views !== undefined && Array.isArray(views.items) ? views.items : []
+			const archived = views !== undefined && Array.isArray(views.archivedSessionIds) ? views.archivedSessionIds : []
+			const pinned = views !== undefined && Array.isArray(views.pinnedSessionIds) ? views.pinnedSessionIds : []
+			lines.push('session: ' + sessionId)
+			lines.push('services: sessions=' + String(sessions !== undefined) + ' workspaces=' + String(workspaces !== undefined))
+			lines.push('list.phase: ' + (list === undefined ? 'missing' : String(list.phase)))
+			lines.push('list.ids: ' + String(ids.length) + ' contains=' + String(ids.includes(sessionId)))
+			lines.push('target ' + summaryLine(byId[sessionId]))
+			lines.push('workspace.phase: ' + (views === undefined ? 'missing' : String(views.phase) + ' state=' + String(views.state)))
+			lines.push('archived: ' + String(archived.length) + ' contains=' + String(archived.includes(sessionId)))
+			lines.push('pinned: ' + String(pinned.length) + ' contains=' + String(pinned.includes(sessionId)))
+			const tombstoneIds = [...tombstoned]
+			lines.push('tombstones: ' + String(tombstoneIds.length) + ' contains=' + String(tombstoned.has(sessionId)))
+			for (const id of tombstoneIds.slice(0, 20)) lines.push('  - ' + id)
+			let viewStore = null
+			try {
+				viewStore = window.localStorage.getItem('dsh.workspace.view.v5')
+			} catch (error) {
+				viewStore = null
+			}
+			lines.push('view store: ' + (viewStore === null ? 'missing' : viewStore.slice(0, 400)))
+			lines.push('workspaces: ' + String(items.length))
+			const accounted = new Set()
+			for (const item of items) {
+				const members = Array.isArray(item.sessionIds) ? item.sessionIds : []
+				for (const member of members) accounted.add(member)
+				lines.push('  - ' + String(item.title) + ' [' + String(item.path) + '] members=' + String(members.length) + ' has=' + String(members.includes(sessionId)))
+			}
+			const archivedSet = new Set(archived)
+			const strays = ids.filter((id) => !accounted.has(id))
+			lines.push('ungrouped candidates: ' + String(strays.length))
+			for (const id of strays.slice(0, 40)) {
+				lines.push('  * ' + id + ' archived=' + String(archivedSet.has(id)) + ' ' + summaryLine(byId[id]))
+			}
+			if (strays.length > 40) lines.push('  … ' + String(strays.length - 40) + ' more')
+			return lines.join('\n')
 		}
 
 		return {
@@ -245,6 +395,7 @@ window.__ModuleLoader__.load({
 					const busy = phase === 'working'
 					const settle = () => { if (!busy) publish(null) }
 					const [hostNote, setHostNote] = React.useState(null)
+					const [cleared, setCleared] = React.useState(null)
 					React.useEffect(() => {
 						let cancelled = false
 						requestHealth().then((payload) => {
@@ -259,9 +410,11 @@ window.__ModuleLoader__.load({
 						setPhase('working')
 						setError(null)
 						requestDelete(request.sessionId).then((result) => {
-							reconcileCatalog(ctx, request.sessionId)
 							setReport(result)
 							setPhase('done')
+							rememberDeleted(ctx, request.sessionId).then((swept) => {
+								if (swept.unarchived.length > 0) setCleared(swept.unarchived)
+							})
 						}).catch((reason) => {
 							setError(reason instanceof Error ? reason.message : String(reason))
 							setPhase('error')
@@ -315,7 +468,8 @@ window.__ModuleLoader__.load({
 					const indexStores = report && report.indexes && typeof report.indexes === 'object' ? report.indexes : {}
 					const notes = report && Array.isArray(report.notes) ? report.notes : []
 					const remarks = notes.slice()
-					if (report && report.registry && report.registry.archived === true) remarks.push(t('dialog.tombstone'))
+					if (report && report.tombstone === true) remarks.push(t('dialog.hidden'))
+					if (Array.isArray(cleared) && cleared.length > 0) remarks.push(t('dialog.unarchived', { ids: cleared.join(', ') }))
 					for (const task of schedules) remarks.push(t('dialog.scheduleDeleted', { title: task.title }))
 					for (const store of Object.keys(indexStores)) {
 						const entry = indexStores[store]
@@ -355,10 +509,63 @@ window.__ModuleLoader__.load({
 					return h(DeleteSessionForm, { key: request.sessionId, request })
 				}
 
+				function DiagnoseSessionForm({ request }) {
+					const [tick, setTick] = React.useState(0)
+					const settle = () => { publishDiagnosis(null) }
+					const text = React.useMemo(
+						() => buildDiagnostics(ctx, request.sessionId),
+						[request.sessionId, tick],
+					)
+					const body = [
+						h('p', {
+							key: 'intro',
+							style: { margin: '0 0 8px', color: 'var(--dsw-alias-label-secondary)', fontSize: '12px' },
+						}, t('diag.intro')),
+						h('pre', {
+							key: 'text',
+							style: {
+								margin: 0,
+								padding: '10px 12px',
+								borderRadius: '8px',
+								border: '0.5px solid var(--dsw-alias-border-l1)',
+								background: 'var(--dsw-alias-bg-l2, rgba(127, 127, 127, 0.08))',
+								fontFamily: 'ui-monospace, SFMono-Regular, Consolas, monospace',
+								fontSize: '11px',
+								lineHeight: '1.5',
+								whiteSpace: 'pre-wrap',
+								wordBreak: 'break-all',
+								maxHeight: '46vh',
+								overflow: 'auto',
+							},
+						}, text),
+					]
+					const footer = [
+						h(Button, { key: 'again', onClick: () => { setTick(tick + 1) } }, t('diag.refresh')),
+						h(Button, { key: 'close', onClick: settle, autoFocus: true }, t('diag.close')),
+					]
+					return h(Dialog, {
+						title: t('diag.title'),
+						footer,
+						onClose: settle,
+						closeLabel: t('diag.close'),
+					}, body)
+				}
+
+				function DiagnoseSessionDialog() {
+					const request = useDiagnosis()
+					if (request === null) return null
+					return h(DiagnoseSessionForm, { key: request.sessionId, request })
+				}
+
 				ctx.slots.inject('shell.overlay', () => ctx.slots.register({
 					name: 'shell.overlay',
 					id: 'dsh-session-delete.dialog',
 				}, DeleteSessionDialog))
+
+				ctx.slots.inject('shell.overlay', () => ctx.slots.register({
+					name: 'shell.overlay',
+					id: 'dsh-session-delete.diagnosis',
+				}, DiagnoseSessionDialog))
 
 				ctx.effect(() => ctx.contextMenus.register({
 					id: 'session.delete',
@@ -383,6 +590,42 @@ window.__ModuleLoader__.load({
 						}]
 					},
 				}), 'dsh-session-delete: session menu')
+
+				ctx.effect(() => ctx.contextMenus.register({
+					id: 'session.diagnose',
+					target: 'session',
+					order: 701,
+					observe: () => [ctx.locale],
+					resolve: (target) => {
+						if (!target || typeof target.sessionId !== 'string') return []
+						return [{
+							id: 'diagnoseSession',
+							label: t('menu.diagnose'),
+							afterContent: true,
+							run: () => {
+								publishDiagnosis({ sessionId: target.sessionId })
+							},
+						}]
+					},
+				}), 'dsh-session-delete: diagnose menu')
+
+				// A browser that is already open (or just reloaded) has to learn the
+				// tombstone list too, not only the browser that ran the delete.
+				ctx.effect(() => {
+					let timer = null
+					let attempts = 0
+					const tick = () => {
+						timer = null
+						if (tombstoneGuard !== null && tombstoneGuard.installed) return
+						attempts += 1
+						if (attempts > 20) return
+						void refreshTombstones(ctx)
+						timer = setTimeout(tick, Math.min(1000 * attempts, 5000))
+					}
+					void refreshTombstones(ctx)
+					timer = setTimeout(tick, 1000)
+					return () => { if (timer !== null) clearTimeout(timer) }
+				}, 'dsh-session-delete: catalog guard')
 			},
 		}
 	},

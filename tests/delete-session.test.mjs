@@ -2,10 +2,10 @@
  * Standalone harness for the deletion routine: exercises target discovery,
  * dry-run, registry cleanup and unlink against a scratch DSH_HOME.
  */
-import { mkdtemp, mkdir, writeFile, readdir, stat } from 'node:fs/promises'
+import { mkdtemp, mkdir, writeFile, readFile, readdir, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { admitRequest, deleteSession } from '../index.js'
+import { admitRequest, deleteSession, tombstonesForClient } from '../index.js'
 
 const sessions = new Set()
 const archived = []
@@ -13,6 +13,7 @@ const unarchived = []
 const unpinned = []
 const emitted = []
 const registry = {
+	archivedSessionIds: [],
 	list: () => [{ id: 'ws-1', path: 'G:/fake', detachSession: async (id) => { sessions.add(id) } }],
 	archiveSession: async (id, options) => { archived.push({ id, options }) },
 	unarchiveSession: async (id) => { unarchived.push(id) },
@@ -160,9 +161,12 @@ report(await countRows('chat-index.sqlite', 'marks', 'session') === 0, 'chat ind
 report(await countRows('usage.sqlite', 'calls', 'session') === 0, 'usage calls are gone')
 report(await countRows('usage.sqlite', 'owners', 'session') === 0, 'usage owners are gone')
 report(sessions.has(id), 'detached from the workspace')
-report(archived.length === 1 && archived[0].id === id && archived[0].options?.stopActivity === true, 'archived as a durable tombstone (and asked the Host to stop work)', JSON.stringify(archived))
-report(unarchived.length === 0, 'never unarchived — that would resurrect the row', JSON.stringify(unarchived))
-report(result.registry.archived === true && result.registry.detached === 1, 'reports the tombstone and the detach', JSON.stringify(result.registry))
+report(archived.length === 0, 'never archives — the archive set doubles as the "show archived" view', JSON.stringify(archived))
+report(unarchived.length === 0, 'nothing to unarchive for a Session that was not archived', JSON.stringify(unarchived))
+report(result.registry.detached === 1 && result.registry.unpinned === true && result.registry.unarchived === false, 'reports the detach, the unpin and the untouched archive set', JSON.stringify(result.registry))
+report(result.tombstone === true, 'records a plugin tombstone', String(result.tombstone))
+const recorded = JSON.parse(await readFile(join(home, 'dsh-session-delete', 'tombstones.json'), 'utf8'))
+report(recorded.entries.some((entry) => entry.sessionId === id), 'the tombstone file names the deleted id', JSON.stringify(recorded.entries))
 report(unpinned.includes(id), 'removed from the pin set')
 report(Awaited(result) !== null, 'report is returned synchronously')
 
@@ -188,6 +192,21 @@ report(await countOne('usage.sqlite', 'calls', 'session', keep) === 1, 'kept the
 // 5. Second deletion of the same id is a clean no-op.
 const again = await deleteSession(ctx, id, {})
 report(again.removed.length === 0 && again.failed.length === 0, 'repeat deletion is a no-op', JSON.stringify(again.notes))
+
+// 5b. 1.2.3's archive markers are swept once: a resident Session whose log is
+//     gone is unarchived and recorded as a plugin tombstone instead.
+const legacyId = '99999999-8888-7777-6666-555555555555'
+registry.archivedSessionIds.push(legacyId)
+const liveSessions = { get: (sessionId) => ({ id: sessionId }) }
+serviceTable = { workspaceRegistry: registry, sessions: liveSessions, sessionPersistence: { stat: async () => undefined } }
+const swept = await tombstonesForClient(ctx)
+report(swept.unarchived.includes(legacyId), 'unarchives a 1.2.3 marker whose log is gone', JSON.stringify(swept.unarchived))
+report(unarchived.includes(legacyId), 'asks the registry to drop that marker', JSON.stringify(unarchived))
+report(swept.ids.includes(legacyId), 'turns that marker into a plugin tombstone', JSON.stringify(swept.ids))
+report(swept.ids.includes(id), 'keeps the tombstone recorded by the delete', JSON.stringify(swept.ids))
+report(swept.count === swept.ids.length, 'count matches the id list')
+const sweptAgain = await tombstonesForClient(ctx)
+report(sweptAgain.unarchived.length === 0, 'sweeps the archive set only once')
 
 // 6. Admission fence: the Host's check wins; without that service, cross-site is refused.
 const headersOf = (extra) => ({ headers: extra })

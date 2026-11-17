@@ -3,23 +3,31 @@
  *
  * The Host ships no Session delete API, so this plugin owns the whole
  * operation: stop the Session, drop it from the workspace registry (membership,
- * archive set, pin set), then remove the on-disk artifacts the Host created for
+ * archive and pin slots), then remove the on-disk artifacts the Host created for
  * that Session — its durable log directory, its rewind snapshots and its
  * projection cache. Content-addressed attachments are shared between Sessions
  * and are deliberately left alone.
+ *
+ * The Host keeps an opened Session resident until the process restarts, so no
+ * amount of disk cleanup removes it from `session.list`. The plugin therefore
+ * records the deleted id in its own tombstone file; the client half reads that
+ * file and keeps the row out of the browser catalog, which hides it in every
+ * archive filter instead of turning it into a permanent "archived" row.
  */
 import { statSync, watch } from 'node:fs'
-import { lstat, readdir, rm } from 'node:fs/promises'
+import { lstat, mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 export const name = 'dsh-session-delete'
 export const inject = ['webServer', 'tools']
 
-export const VERSION = '1.2.3'
+export const VERSION = '1.3.0'
 const ROUTE = '/session-delete'
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
 const MAX_BODY_BYTES = 64 * 1024
+/** Directory under DSH_HOME that holds this plugin's own bookkeeping. */
+const STATE_DIR = 'dsh-session-delete'
 
 class RequestError extends Error {
 	constructor(message, status = 400) {
@@ -81,6 +89,173 @@ function homeFromLog(logPath) {
 	return resolve(dirname(dirname(dirname(dirname(logPath)))))
 }
 
+/** Cache of the resolved DSH_HOME, filled by the first lookup. */
+let knownHome
+
+/**
+ * Resolve DSH_HOME without a Session id: the environment variable when the Host
+ * exports it, otherwise the directory layout of any stored Session log.
+ */
+async function resolveHome(ctx) {
+	if (knownHome !== undefined) return knownHome
+	const fromEnv = process.env.DSH_HOME
+	if (fromEnv !== undefined && fromEnv !== '') return (knownHome = resolve(fromEnv))
+	const persistence = ctx.get('sessionPersistence')
+	if (persistence !== undefined && typeof persistence.list === 'function') {
+		const listed = await persistence.list().catch(() => undefined)
+		for (const entry of Array.isArray(listed) ? listed : []) {
+			const path = entry?.location?.path
+			if (typeof path === 'string' && path !== '') return (knownHome = homeFromLog(path))
+		}
+	}
+	throw new RequestError('cannot determine DSH_HOME', 500)
+}
+
+/**
+ * This plugin's tombstone file.
+ *
+ * It records Sessions this plugin deleted. The Host cannot evict a resident
+ * Session from `session.list`, so the browser needs a durable answer to "which
+ * rows did the user delete?" — the archive set cannot serve, because it doubles
+ * as the "show archived" view and would turn a deleted Session into a grayed row.
+ */
+function tombstoneFile(home) {
+	return join(home, STATE_DIR, 'tombstones.json')
+}
+
+/** Read the tombstone file; missing, unreadable or malformed state reads as empty. */
+async function readTombstoneState(home) {
+	let parsed
+	try {
+		parsed = JSON.parse(await readFile(tombstoneFile(home), 'utf8'))
+	} catch {
+		parsed = undefined
+	}
+	const entries = []
+	for (const entry of Array.isArray(parsed?.entries) ? parsed.entries : []) {
+		const sessionId = typeof entry?.sessionId === 'string' ? entry.sessionId : undefined
+		if (sessionId === undefined || !SAFE_ID.test(sessionId)) continue
+		entries.push({
+			sessionId,
+			deletedAt: typeof entry?.deletedAt === 'string' ? entry.deletedAt : null,
+		})
+	}
+	return {
+		version: 1,
+		entries,
+		legacyArchiveSwept: parsed?.legacyArchiveSwept === true,
+	}
+}
+
+/** Replace the tombstone file atomically (write, then rename over). */
+async function writeTombstoneState(home, state) {
+	const file = tombstoneFile(home)
+	await mkdir(dirname(file), { recursive: true })
+	const temp = `${file}.${process.pid}.${Date.now()}.tmp`
+	await writeFile(temp, JSON.stringify(state, null, '\t') + '\n', 'utf8')
+	await rename(temp, file)
+}
+
+/** Remember one deleted Session id, replacing any earlier record. */
+async function recordTombstone(home, sessionId, notes) {
+	try {
+		const state = await readTombstoneState(home)
+		state.entries = [
+			...state.entries.filter(entry => entry.sessionId !== sessionId),
+			{ sessionId, deletedAt: new Date().toISOString() },
+		]
+		await writeTombstoneState(home, state)
+		return true
+	} catch (error) {
+		notes.push(`tombstone record failed: ${errorMessage(error)}`)
+		return false
+	}
+}
+
+/** Whether a Session still has a stored log, i.e. is not deleted. */
+async function hasStoredLog(ctx, sessionId) {
+	const persistence = ctx.get('sessionPersistence')
+	if (persistence === undefined) return true
+	try {
+		return (await persistence.stat(sessionId)) !== undefined
+	} catch {
+		return true
+	}
+}
+
+/**
+ * Forget tombstones that outlived their purpose: once the Host restarts, a
+ * deleted Session is neither resident nor stored, so the catalog no longer
+ * carries it and the row cannot come back.
+ */
+async function pruneTombstones(ctx, home) {
+	const state = await readTombstoneState(home)
+	const kept = []
+	for (const entry of state.entries) {
+		if (ctx.get('sessions')?.get?.(entry.sessionId) !== undefined) {
+			kept.push(entry)
+			continue
+		}
+		if (await hasStoredLog(ctx, entry.sessionId)) kept.push(entry)
+	}
+	if (kept.length !== state.entries.length) {
+		state.entries = kept
+		await writeTombstoneState(home, state).catch(() => {})
+	}
+	return state
+}
+
+/**
+ * One-time cleanup of 1.2.3's archive tombstones.
+ *
+ * 1.2.3 hid the row by archiving it, which made a deleted Session a permanent
+ * grayed row under "show archived". A resident Session whose log is already
+ * gone and which sits in the archive set has no other explanation, so it is
+ * unarchived and recorded as a tombstone here instead. Runs once.
+ */
+async function sweepLegacyArchive(ctx, home, state, notes) {
+	const registry = ctx.get('workspaceRegistry')
+	if (registry === undefined || typeof registry.unarchiveSession !== 'function') return []
+	if (state.legacyArchiveSwept === true) return []
+	const archived = Array.isArray(registry.archivedSessionIds) ? [...registry.archivedSessionIds] : []
+	const cleared = []
+	for (const sessionId of archived) {
+		if (typeof sessionId !== 'string' || !SAFE_ID.test(sessionId)) continue
+		if (state.entries.some(entry => entry.sessionId === sessionId)) continue
+		if (ctx.get('sessions')?.get?.(sessionId) === undefined) continue
+		if (await hasStoredLog(ctx, sessionId)) continue
+		try {
+			await registry.unarchiveSession(sessionId)
+			state.entries.push({ sessionId, deletedAt: new Date().toISOString() })
+			cleared.push(sessionId)
+		} catch (error) {
+			notes.push(`legacy tombstone cleanup failed for ${sessionId}: ${errorMessage(error)}`)
+		}
+	}
+	state.legacyArchiveSwept = true
+	await writeTombstoneState(home, state).catch((error) => {
+		notes.push(`tombstone state was not saved: ${errorMessage(error)}`)
+	})
+	return cleared
+}
+
+/** Tombstone payload the browser half polls to keep deleted rows out of the catalog. */
+export async function tombstonesForClient(ctx) {
+	const notes = []
+	const home = await resolveHome(ctx)
+	const state = await readTombstoneState(home)
+	const unarchived = await sweepLegacyArchive(ctx, home, state, notes)
+	const pruned = await pruneTombstones(ctx, home)
+	return {
+		plugin: name,
+		version: VERSION,
+		count: pruned.entries.length,
+		ids: pruned.entries.map(entry => entry.sessionId),
+		unarchived,
+		notes,
+	}
+}
+
 /**
  * Resolve every Session-owned path, using the persistence backend's own
  * location as the authority and sweeping the two historical directory namings
@@ -102,6 +277,7 @@ async function collectTargets(ctx, sessionId) {
 		? resolve(process.env.DSH_HOME)
 		: logPath !== undefined ? homeFromLog(logPath) : undefined
 	if (home === undefined) throw new RequestError('cannot determine DSH_HOME', 500)
+	knownHome = home
 
 	const targets = []
 	const seen = new Set()
@@ -179,9 +355,19 @@ async function stopActivity(ctx, sessionId, notes) {
  * id is deliberately left archived — unarchiving it here would resurrect the
  * row.
  */
+/**
+ * Drop the Session from the workspace registry: its pin slot, any archive slot
+ * and every workspace's member account. Nothing is archived on the way out.
+ *
+ * Archiving looks like a cheap way to hide the row (the sidebar hides archived
+ * rows by default), but the archive set is also the source of the "show
+ * archived" view, so a tombstone there turns a deleted Session into a permanent
+ * grayed row. The plugin hides the row from the browser catalog instead; see
+ * `recordTombstone` and the client half.
+ */
 async function forgetInRegistry(ctx, sessionId, notes) {
 	const registry = ctx.get('workspaceRegistry')
-	const report = { workspaces: [], detached: 0, archived: false, unpinned: false }
+	const report = { workspaces: [], detached: 0, unpinned: false, unarchived: false }
 	if (registry === undefined) {
 		notes.push('workspace registry unavailable; registry entries were not cleaned')
 		return report
@@ -193,14 +379,13 @@ async function forgetInRegistry(ctx, sessionId, notes) {
 		notes.push(`unpin failed: ${errorMessage(error)}`)
 	}
 	try {
-		if (typeof registry.archiveSession !== 'function') {
-			notes.push('workspace registry has no archiveSession; the sidebar row may reappear until the Host restarts')
-		} else {
-			await registry.archiveSession(sessionId, { stopActivity: true })
-			report.archived = true
+		const archived = Array.isArray(registry.archivedSessionIds) ? registry.archivedSessionIds : []
+		if (archived.includes(sessionId) && typeof registry.unarchiveSession === 'function') {
+			await registry.unarchiveSession(sessionId)
+			report.unarchived = true
 		}
 	} catch (error) {
-		notes.push(`archive tombstone failed: ${errorMessage(error)}`)
+		notes.push(`unarchive failed: ${errorMessage(error)}`)
 	}
 	let entities = []
 	try {
@@ -376,7 +561,8 @@ export async function deleteSession(ctx, rawSessionId, options = {}) {
 		targets,
 		removed: [],
 		failed: [],
-		registry: { workspaces: [], detached: 0, archived: false, unpinned: false },
+		registry: { workspaces: [], detached: 0, unpinned: false, unarchived: false },
+		tombstone: false,
 		indexes: await purgeIndexes(plan.home, sessionId, true, notes),
 		schedules: { deleted: [], skipped: [], matched: [] },
 		notes,
@@ -407,6 +593,9 @@ export async function deleteSession(ctx, rawSessionId, options = {}) {
 	}
 	report.schedules = await purgeSchedules(ctx, sessionId, notes)
 	report.indexes = await purgeIndexes(plan.home, sessionId, false, notes)
+	// The tombstone must exist before the broadcast: a browser that reloads
+	// right after the delete asks for it and keeps the row out of the catalog.
+	report.tombstone = await recordTombstone(plan.home, sessionId, notes)
 	await announceRemoval(ctx, sessionId, notes)
 	return report
 }
@@ -502,6 +691,13 @@ function createHandler(ctx, status) {
 				sendJson(response, 200, await status.impl(ctx, body.sessionId, { dryRun: body.dryRun === true }))
 				return
 			}
+			// The browser half keeps deleted rows out of its catalog from this list.
+			// It also drives the one-time cleanup of 1.2.3's archive tombstones.
+			if (url.pathname === `${ROUTE}/api/tombstones` && request.method === 'GET') {
+				const tombstones = typeof status.tombstones === 'function' ? status.tombstones : tombstonesForClient
+				sendJson(response, 200, await tombstones(ctx))
+				return
+			}
 			sendJson(response, 404, { error: 'not found' })
 		} catch (error) {
 			const statusCode = error instanceof RequestError ? error.status : 500
@@ -513,7 +709,7 @@ function createHandler(ctx, status) {
 function createToolDefinition(ctx, status) {
 	return {
 		name: 'session_delete',
-		description: 'Permanently delete one DSH Session and every artifact the Host stores for it: its durable session log directory, its rewind snapshots, its projection cache, and its workspace/archive/pin registry entries. Shared content-addressed attachments are never touched. Irreversible; use dryRun to list the targets first.',
+		description: 'Permanently delete one DSH Session and every artifact the Host stores for it: its durable session log directory, its rewind snapshots, its projection cache, and its workspace membership/archive/pin registry slots. The plugin also records a tombstone so browsers keep the row out of the catalog until the Host restarts (the Host itself cannot evict a resident Session). Shared content-addressed attachments are never touched. Irreversible; use dryRun to list the targets first.',
 		parameters: {
 			type: 'object',
 			properties: {
@@ -561,6 +757,7 @@ function moduleMtime() {
 function createStatus() {
 	return {
 		impl: deleteSession,
+		tombstones: tombstonesForClient,
 		version: VERSION,
 		generation: 0,
 		loadedAt: Date.now(),
@@ -605,6 +802,7 @@ async function reloadHostModule(ctx, status) {
 			throw new Error('the edited module no longer exports deleteSession()')
 		}
 		status.impl = module.deleteSession
+		if (typeof module.tombstonesForClient === 'function') status.tombstones = module.tombstonesForClient
 		if (typeof module.VERSION === 'string') status.version = module.VERSION
 		status.generation += 1
 		status.reloadedAt = stamp
