@@ -4,10 +4,10 @@
 
 > Adds a permanent **Delete session** action right after **Archive session** in the session context menu, and removes every artifact the Host keeps for that Session. MIT licensed.
 
-- 版本：1.2.2
+- 版本：1.2.3
 - 分发：GitHub 仓库 + Release 里的 zip/tgz（未发布到 npm：npm 上 `dsh-session-delete` 已被他人占用，且发布需要账号 2FA）
 - 宿主侧提供同名 Agent 工具 `session_delete({ sessionId, dryRun })` 与 HTTP 接口，浏览器里点右键菜单和 Agent 调用走同一套删除实现。
-- 删除后宿主广播 `api-session/removed`，侧栏那一行立即消失，无需刷新。
+- 删除后宿主广播 `api-session/removed`，侧栏那一行立即消失，无需刷新；同时把该 id 写进归档集合当墓碑，防止宿主内存里仍存活的会话行在下次列表时以“未分组”身份复活（见下）。
 - 共享附件（`attachments/v1/objects/<sha>`）按内容寻址、多会话共用，**刻意不删**。
 
 ## 删除范围
@@ -17,7 +17,7 @@
 | 会话日志 | `$DSH_HOME/sessions/<projectKey>/<id>` 与历史命名 `session-<id>`（两种命名都会扫） |
 | 回退快照 | `$DSH_HOME/rewind-snapshots/{<id>,session-<id>}` |
 | 投影缓存 | `$DSH_HOME/storages/session_projcache/sessions/{<id>,session-<id>}.json`（含 `.json.tmp`、`.tmp` 残留） |
-| 注册表 | `storages/workspace.json` 中的 sessionIds（工作区成员）、archivedSessionIds、pinnedSessionIds |
+| 注册表 | `storages/workspace.json` 中的 sessionIds（工作区成员）、pinnedSessionIds（置顶）；archivedSessionIds 不清理，反而写入该 id 作**墓碑**（见下节） |
 | 定时任务 | `target.kind` 为 `session`（投递进该会话）或 `new_once`（预留了该会话身份、会话没了就永远无法投递）的任务，经 `schedule.edit({ id, action: 'delete' })` 正式删除（不改文件） |
 | 聊天索引 | `$DSH_HOME/bot/chat-index.sqlite` 的 `lines`(FTS5) 与 `marks` 表，`session = <id>` 与 `session = session-<id>` 两种键 |
 | 用量账本 | `$DSH_HOME/bot/usage.sqlite` 的 `calls` / `marks` / `owners` / `kinds` 表，同样两种键 |
@@ -32,7 +32,7 @@
 ## 使用
 
 - 侧栏会话行右键 → **删除会话**（危险色，位于“归档会话”之后）→ 确认弹窗显示会话标题，执行后列出删除的路径与字节数、被删的定时任务、被清理的索引行数、失败项、备注。
-- 删除成功后宿主广播 `api-session/removed`，侧栏那一行**立即消失**，不需要刷新页面（客户端同时调用 `sessions.handleSessionRemoved()` + `sessions.refresh()` 兜底）。
+- 删除成功后宿主广播 `api-session/removed`，侧栏那一行**立即消失**，不需要刷新页面（客户端先 `sessions.handleSessionRemoved()` 移除，再 `sessions.refresh()` 重拉基线，**最后再移除一次**兜底）。
 - Agent 工具 `session_delete({ sessionId, dryRun })`：同一套逻辑，`dryRun=true` 只列出将被删除的路径、任务与索引行数。
 - HTTP（客户端走这条通道，带 `connection.requestRejection` 请求栅栏；Host 没有该服务时退化为 `Sec-Fetch-Site` + `Origin`/`Host` 同源校验）：
   - `GET /session-delete/api/health` —— 宿主半的加载状态（见下）
@@ -40,6 +40,24 @@
   - `POST /session-delete/api/delete` `{ "sessionId": "...", "dryRun": false }`
 
 会话 ID 只接受 `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`，`../`、绝对路径、空串一律拒绝。
+
+## 为什么留一个归档墓碑（1.2.3）
+
+DSH 没有“销毁会话”的公开 API：`ctx.sessions` 只提供 create/prepare/enter/announce/get/list/fork，唯一能把会话从内存里移除的路径是 `enter()` 返回的 detach 闭包（由 agent-loop 的 teardown 持有，而 API 会话控制器 `resumeObserved` 拿到的 `AgentHandle.dispose` 被丢掉了）。因此**任何在 GUI 里打开过、提问过的会话都会常驻宿主进程直到进程退出**，`session.list` 每次都把它报回来。
+
+只要它在列表里、又不属于任何工作区，侧栏就会按“未分组”渲染（`dsh-client-ui-workspace` 的 `owningGroupKey()` 找不到工作区就回落到 `UNGROUPED_KEY`）。这正是 1.2.2 的 BUG：
+
+1. `forgetInRegistry` 先把会话从工作区 detach 掉，再删磁盘；
+2. 客户端 `handleSessionRemoved()` 之后紧接着 `refresh()`，而 `ClientSessions.refreshList()` 开头就把 mutation 日志重置，刚记下的 remove 被丢掉，基线又把它加回来；
+3. 于是一行没有工作区归属的幽灵出现在“未分组”，再删一次只剩“未找到磁盘数据，只清理了工作区记录”。
+
+1.2.3 的处理：
+
+- 注册表清理顺序改为 **unpin → archive（墓碑）→ detach**，归档先落盘，所以中间任何一次快照都不会把它渲染成“未分组”；
+- 客户端顺序改为 **restore 立即移除 → refresh 重拉基线 → 再移除一次**；
+- 墓碑利用的是侧栏的既有语义：`ArchivedFilter = 'hide'` 是默认值，归档行默认不显示、也不可打开。宿主重启后该 id 既不在磁盘、也不在内存里，列表里根本没有它的 summary，墓碑变成惰性条目（不会显示）。
+- 代价：在这一个宿主进程的生命周期内，如果把侧栏切到“显示已归档”，会看到一条不可打开的灰行；磁盘上 `workspace.json` 的 `archivedSessionIds` 会保留这个 id。
+
 
 ## 安装
 
@@ -66,17 +84,17 @@ git clone https://github.com/LIQiang-IT/dsh-session-delete.git
 - 客户端在确认弹窗打开时读一次 health；若 `stale === true` 或有 `lastReloadError`，弹窗顶部用危险色提示“宿主插件仍在跑旧代码”，避免在不知情的情况下以为改的东西已经生效。
 - 只有**首次安装**（bundle 尚未进入进程）需要重启一次；此后改 `index.js` 不用重启。
 
-客户端 `client.js` 属于浏览器侧模块，改动后需要重新载入页面（新建会话/新窗口或刷新 Web UI）才能拿到新文件。
+客户端 `client.js` 属于浏览器侧模块：宿主会 stat 轮询客户端包入口文件并通过 `/plugins/events` 推送 rebuilt 帧，正常情况下开着的页面会自动热替换；若没换过来，刷新一次 Web UI（Ctrl+R）即可。
 
 ## 测试
 
 ```bash
-node tests/delete-session.test.mjs   # 36 项断言（scratch DSH_HOME，不碰真实数据）
-node tests/reload.test.mjs          # 8 项断言
+node tests/delete-session.test.mjs   # 46 项断言（scratch DSH_HOME，不碰真实数据）
+node tests/reload.test.mjs          # 7 项断言
 npm test
 ```
 
-- `tests/delete-session.test.mjs`：非法 id 拒绝、`dryRun` 不落盘且只列出待删任务、5 类磁盘目标删除、注册表三处清理、定时任务真删、两个 sqlite 的按 id 清理、对照组（keep 会话）全部保留、重复删除幂等。
+- `tests/delete-session.test.mjs`：非法 id 拒绝、`dryRun` 不落盘且只列出待删任务、5 类磁盘目标删除、注册表清理（unpin → archive 墓碑 → detach，且断言**从不** unarchive）、定时任务真删、两个 sqlite 的按 id 清理、对照组（keep 会话）全部保留、重复删除幂等。
 - `tests/reload.test.mjs`：挂载路由、health 初始状态、改文件后自动换模块（`generation` 变 1、`version` 变新值）、无重载错误、卸载释放路由。
 
 测试全部在 `mkdtemp` 出来的临时 `DSH_HOME` 里跑，不读写真机数据。

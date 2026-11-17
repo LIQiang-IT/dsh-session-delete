@@ -21,7 +21,7 @@ window.__ModuleLoader__.load({
 			zh: {
 				'menu.deleteSession': '删除会话',
 				'dialog.title': '删除会话',
-				'dialog.description': '将永久删除“{title}”的一切相关数据：会话日志、回退快照、投影缓存，以及它在工作区、归档和置顶中的记录。共享附件不受影响。此操作不可撤销。',
+				'dialog.description': '将永久删除“{title}”的一切相关数据：会话日志、回退快照、投影缓存，以及它在工作区与置顶中的记录。共享附件不受影响。此操作不可撤销。',
 				'dialog.descriptionDone': '“{title}”已删除。',
 				'dialog.target': '会话 ID：{id}',
 				'dialog.cancel': '取消',
@@ -33,12 +33,13 @@ window.__ModuleLoader__.load({
 				'dialog.scheduleDeleted': '已删除指向它的定时任务：{title}',
 				'dialog.indexPurged': '已从 {store} 索引清理 {count} 行',
 				'dialog.hostStale': '宿主插件仍在跑旧代码（{reason}）。重启 DSH 前，这里的删除行为可能与源码不一致。',
+				'dialog.tombstone': '已在归档中留下隐藏标记：宿主重启前它仍把该会话留在内存目录里，这一标记可确保侧栏不再把它显示为“未分组”。',
 				'dialog.close': '关闭',
 			},
 			en: {
 				'menu.deleteSession': 'Delete session',
 				'dialog.title': 'Delete session',
-				'dialog.description': 'This permanently deletes “{title}” and everything stored for it: the session log, rewind snapshots, the projection cache, and its workspace, archive and pin records. Shared attachments are unaffected. This cannot be undone.',
+				'dialog.description': 'This permanently deletes “{title}” and everything stored for it: the session log, rewind snapshots, the projection cache, and its workspace and pin records. Shared attachments are unaffected. This cannot be undone.',
 				'dialog.descriptionDone': '“{title}” was deleted.',
 				'dialog.target': 'Session ID: {id}',
 				'dialog.cancel': 'Cancel',
@@ -50,6 +51,7 @@ window.__ModuleLoader__.load({
 				'dialog.scheduleDeleted': 'Deleted the scheduled task aimed at it: {title}',
 				'dialog.indexPurged': 'Removed {count} row(s) from the {store} index',
 				'dialog.hostStale': 'The Host plugin is still running older code ({reason}). Until DSH restarts, this delete may not match the sources on disk.',
+				'dialog.tombstone': 'Left a hidden archived marker: until the Host restarts it still lists this Session in memory, and the marker keeps the sidebar from filing it under "Ungrouped".',
 				'dialog.close': 'Close',
 			},
 		}
@@ -197,23 +199,37 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
-		 * Drop the deleted Session from the live catalog and re-pull the Host
-		 * baseline, so the sidebar row disappears without a page reload.
+		 * Drop the deleted Session from the live catalog row set.
+		 *
+		 * Order matters: `ClientSessions.refresh()` resets the mutation log
+		 * (`this.listMutations = mutations`) before it re-baselines from
+		 * `session.list`, so a removal recorded *before* the refresh is thrown
+		 * away and the Host's baseline puts the row back. The Host keeps the
+		 * Session resident until it restarts, so that resurrected row has no
+		 * workspace membership left and the sidebar files it under "未分组".
+		 *
+		 * Therefore: remove immediately (no flicker), refresh, then remove
+		 * again so the removal lands on top of the new baseline.
 		 */
 		function reconcileCatalog(ctx, sessionId) {
 			const sessions = ctx.get('sessions')
 			if (!sessions || typeof sessions !== 'object') return
-			try {
-				if (typeof sessions.handleSessionRemoved === 'function') sessions.handleSessionRemoved(sessionId)
-			} catch (error) {
-				console.error('dsh-session-delete: handleSessionRemoved failed', error)
+			const drop = () => {
+				try {
+					if (typeof sessions.handleSessionRemoved === 'function') sessions.handleSessionRemoved(sessionId)
+				} catch (error) {
+					console.error('dsh-session-delete: handleSessionRemoved failed', error)
+				}
 			}
+			drop()
+			let pending
 			try {
-				const pending = typeof sessions.refresh === 'function' ? sessions.refresh() : undefined
-				if (pending && typeof pending.catch === 'function') pending.catch(() => {})
+				pending = typeof sessions.refresh === 'function' ? sessions.refresh() : undefined
 			} catch (error) {
 				console.error('dsh-session-delete: list refresh failed', error)
+				return
 			}
+			if (pending && typeof pending.then === 'function') pending.then(drop, drop)
 		}
 
 		return {
@@ -299,6 +315,7 @@ window.__ModuleLoader__.load({
 					const indexStores = report && report.indexes && typeof report.indexes === 'object' ? report.indexes : {}
 					const notes = report && Array.isArray(report.notes) ? report.notes : []
 					const remarks = notes.slice()
+					if (report && report.registry && report.registry.archived === true) remarks.push(t('dialog.tombstone'))
 					for (const task of schedules) remarks.push(t('dialog.scheduleDeleted', { title: task.title }))
 					for (const store of Object.keys(indexStores)) {
 						const entry = indexStores[store]

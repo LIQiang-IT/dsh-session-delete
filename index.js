@@ -16,7 +16,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 export const name = 'dsh-session-delete'
 export const inject = ['webServer', 'tools']
 
-export const VERSION = '1.2.2'
+export const VERSION = '1.2.3'
 const ROUTE = '/session-delete'
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
 const MAX_BODY_BYTES = 64 * 1024
@@ -160,13 +160,47 @@ async function stopActivity(ctx, sessionId, notes) {
 	await new Promise((done) => { setTimeout(done, 120) })
 }
 
-/** Drop every registry trace: workspace membership, archive membership, pin membership. */
+/**
+ * Drop every registry trace and leave a durable tombstone.
+ *
+ * A Session that has ever been opened is resident in the Host's in-memory store
+ * (`ctx.sessions`), and only the agent-loop teardown — a capability the API
+ * drops when it resumes an Agent — can evict it. Until the Host restarts, every
+ * `session.list` therefore keeps reporting the id. Detaching the workspace
+ * membership alone would turn that leftover row into an orphan the sidebar
+ * renders under "未分组" (Ungrouped), which is the bug this ordering avoids.
+ *
+ * So: unpin (pin and archive are mutually exclusive), archive the id, then drop
+ * the workspace membership. Archiving first means the leftover row is already
+ * flagged as hidden while it still has a home, so no intermediate registry
+ * snapshot can render it under "未分组". The archive is the one durable flag
+ * the sidebar hides by default (`ArchivedFilter = 'hide'`), which keeps the
+ * resident phantom invisible across replays, reconnects and page reloads. The
+ * id is deliberately left archived — unarchiving it here would resurrect the
+ * row.
+ */
 async function forgetInRegistry(ctx, sessionId, notes) {
 	const registry = ctx.get('workspaceRegistry')
-	const report = { workspaces: [], detached: 0, unarchived: false, unpinned: false }
+	const report = { workspaces: [], detached: 0, archived: false, unpinned: false }
 	if (registry === undefined) {
 		notes.push('workspace registry unavailable; registry entries were not cleaned')
 		return report
+	}
+	try {
+		await registry.unpinSession?.(sessionId)
+		report.unpinned = true
+	} catch (error) {
+		notes.push(`unpin failed: ${errorMessage(error)}`)
+	}
+	try {
+		if (typeof registry.archiveSession !== 'function') {
+			notes.push('workspace registry has no archiveSession; the sidebar row may reappear until the Host restarts')
+		} else {
+			await registry.archiveSession(sessionId, { stopActivity: true })
+			report.archived = true
+		}
+	} catch (error) {
+		notes.push(`archive tombstone failed: ${errorMessage(error)}`)
 	}
 	let entities = []
 	try {
@@ -182,18 +216,6 @@ async function forgetInRegistry(ctx, sessionId, notes) {
 		} catch (error) {
 			notes.push(`detach from workspace failed: ${errorMessage(error)}`)
 		}
-	}
-	try {
-		await registry.unarchiveSession?.(sessionId)
-		report.unarchived = true
-	} catch (error) {
-		notes.push(`unarchive failed: ${errorMessage(error)}`)
-	}
-	try {
-		await registry.unpinSession?.(sessionId)
-		report.unpinned = true
-	} catch (error) {
-		notes.push(`unpin failed: ${errorMessage(error)}`)
 	}
 	return report
 }
@@ -354,7 +376,7 @@ export async function deleteSession(ctx, rawSessionId, options = {}) {
 		targets,
 		removed: [],
 		failed: [],
-		registry: { workspaces: [], detached: 0, unarchived: false, unpinned: false },
+		registry: { workspaces: [], detached: 0, archived: false, unpinned: false },
 		indexes: await purgeIndexes(plan.home, sessionId, true, notes),
 		schedules: { deleted: [], skipped: [], matched: [] },
 		notes,

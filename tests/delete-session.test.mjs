@@ -8,11 +8,13 @@ import { join } from 'node:path'
 import { admitRequest, deleteSession } from '../index.js'
 
 const sessions = new Set()
+const archived = []
 const unarchived = []
 const unpinned = []
 const emitted = []
 const registry = {
 	list: () => [{ id: 'ws-1', path: 'G:/fake', detachSession: async (id) => { sessions.add(id) } }],
+	archiveSession: async (id, options) => { archived.push({ id, options }) },
 	unarchiveSession: async (id) => { unarchived.push(id) },
 	unpinSession: async (id) => { unpinned.push(id) },
 }
@@ -158,7 +160,10 @@ report(await countRows('chat-index.sqlite', 'marks', 'session') === 0, 'chat ind
 report(await countRows('usage.sqlite', 'calls', 'session') === 0, 'usage calls are gone')
 report(await countRows('usage.sqlite', 'owners', 'session') === 0, 'usage owners are gone')
 report(sessions.has(id), 'detached from the workspace')
-report(unarchived.includes(id) && unpinned.includes(id), 'removed from archive and pin sets')
+report(archived.length === 1 && archived[0].id === id && archived[0].options?.stopActivity === true, 'archived as a durable tombstone (and asked the Host to stop work)', JSON.stringify(archived))
+report(unarchived.length === 0, 'never unarchived — that would resurrect the row', JSON.stringify(unarchived))
+report(result.registry.archived === true && result.registry.detached === 1, 'reports the tombstone and the detach', JSON.stringify(result.registry))
+report(unpinned.includes(id), 'removed from the pin set')
 report(Awaited(result) !== null, 'report is returned synchronously')
 
 function Awaited() { return true }
