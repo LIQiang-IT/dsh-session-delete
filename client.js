@@ -225,6 +225,7 @@ window.__ModuleLoader__.load({
 		const TOMBSTONE_ENDPOINT = 'session-delete/api/tombstones'
 		let tombstoned = new Set()
 		let tombstoneGuard = null
+		let hostFilter = null
 
 		async function requestTombstones() {
 			const response = await fetch(new URL(TOMBSTONE_ENDPOINT, document.baseURI).href, { cache: 'no-store' })
@@ -232,7 +233,8 @@ window.__ModuleLoader__.load({
 			const payload = await response.json()
 			const ids = Array.isArray(payload && payload.ids) ? payload.ids.filter((id) => typeof id === 'string') : []
 			const unarchived = Array.isArray(payload && payload.unarchived) ? payload.unarchived.filter((id) => typeof id === 'string') : []
-			return { ids, unarchived }
+			const filter = payload && payload.filter && typeof payload.filter === 'object' ? payload.filter : null
+			return { ids, unarchived, filter }
 		}
 
 		/** Remove one row from the live catalog, if the row is still there. */
@@ -250,31 +252,50 @@ window.__ModuleLoader__.load({
 			}
 		}
 
-		/** Re-drop tombstoned rows whenever the catalog changes. */
+		/** Re-drop tombstoned rows whenever the catalog changes, and on a slow poll. */
 		function installCatalogGuard(ctx) {
 			if (tombstoneGuard !== null) return tombstoneGuard
-			const guard = { installed: false, timer: null }
+			const guard = { installed: false, subscribed: false, polling: false, polls: 0, drops: 0, timer: null, interval: null }
 			tombstoneGuard = guard
+			const sweep = () => {
+				guard.polls += 1
+				for (const id of tombstoned) {
+					if (dropCatalogRow(ctx, id)) guard.drops += 1
+				}
+			}
 			const sessions = ctx.get('sessions')
 			const store = sessions === undefined ? undefined : sessions.list
-			if (store === undefined || typeof store.subscribe !== 'function') return guard
+			if (store !== undefined && typeof store.subscribe === 'function') {
+				guard.subscribed = true
+				store.subscribe(() => {
+					if (guard.timer !== null) return
+					// Sweep after the store settles: handleSessionRemoved writes it too.
+					guard.timer = setTimeout(() => {
+						guard.timer = null
+						sweep()
+					}, 0)
+				})
+			}
+			// A subscription is not enough on its own: the catalog can be rebuilt
+			// from a fresh Host pull that this browser half never observes, and the
+			// store's own subscribe may be missing. Re-dropping on a slow poll while
+			// any tombstone exists keeps the row gone in every case.
+			guard.interval = setInterval(sweep, 1500)
+			ctx.effect(() => () => {
+				if (guard.interval !== null) clearInterval(guard.interval)
+				guard.interval = null
+			}, 'dsh-session-delete: tombstone poll')
+			guard.polling = true
 			guard.installed = true
-			store.subscribe(() => {
-				if (guard.timer !== null) return
-				// Sweep after the store settles: handleSessionRemoved writes it too.
-				guard.timer = setTimeout(() => {
-					guard.timer = null
-					for (const id of tombstoned) dropCatalogRow(ctx, id)
-				}, 0)
-			})
 			return guard
 		}
 
 		/** Read the Host tombstone list, then drop every row it names. */
 		async function refreshTombstones(ctx) {
 			try {
-				const { ids, unarchived } = await requestTombstones()
+				const { ids, unarchived, filter } = await requestTombstones()
 				tombstoned = new Set(ids)
+				hostFilter = filter
 				installCatalogGuard(ctx)
 				for (const id of ids) dropCatalogRow(ctx, id)
 				return { ids, unarchived }
@@ -358,6 +379,16 @@ window.__ModuleLoader__.load({
 			const tombstoneIds = [...tombstoned]
 			lines.push('tombstones: ' + String(tombstoneIds.length) + ' contains=' + String(tombstoned.has(sessionId)))
 			for (const id of tombstoneIds.slice(0, 20)) lines.push('  - ' + id)
+			const guard = tombstoneGuard
+			lines.push('guard: installed=' + String(guard !== null && guard.installed === true)
+				+ ' subscribed=' + String(guard !== null && guard.subscribed === true)
+				+ ' polls=' + String(guard === null ? 0 : guard.polls)
+				+ ' drops=' + String(guard === null ? 0 : guard.drops))
+			lines.push('host filter: ' + (hostFilter === null
+				? 'unknown'
+				: 'installed=' + String(hostFilter.installed === true)
+					+ ' wrapped=' + String(hostFilter.wrapped ?? 0)
+					+ ' note=' + String(hostFilter.note || '-').slice(0, 160)))
 			let viewStore = null
 			try {
 				viewStore = window.localStorage.getItem('dsh.workspace.view.v5')

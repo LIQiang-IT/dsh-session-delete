@@ -4,10 +4,10 @@
 
 > Adds a permanent **Delete session** action right after **Archive session** in the session context menu, and removes every artifact the Host keeps for that Session. MIT licensed.
 
-- 版本：1.3.0
+- 版本：1.3.1
 - 分发：GitHub 仓库 + Release 里的 zip/tgz（未发布到 npm：npm 上 `dsh-session-delete` 已被他人占用，且发布需要账号 2FA）
 - 宿主侧提供同名 Agent 工具 `session_delete({ sessionId, dryRun })` 与 HTTP 接口，浏览器里点右键菜单和 Agent 调用走同一套删除实现。
-- 删除后宿主广播 `api-session/removed`，侧栏那一行立即消失，无需刷新；宿主还会把该 id 记进自己的墓碑文件，浏览器半读取它并在目录每次刷新后重新剔除该行 —— 宿主内存里仍存活的会话因此不会以“未分组”身份复活（见下）。
+- 删除后宿主广播 `api-session/removed`，侧栏那一行立即消失，无需刷新；宿主还会把该 id 记进自己的墓碑文件，并**直接过滤自己的会话列表**（`sessionQuery.listSessions`）—— 宿主内存里仍存活的会话既不会被任何一次列表拉回，也不会以“未分组”身份复活；浏览器半再兜一层（见下）。
 - 共享附件（`attachments/v1/objects/<sha>`）按内容寻址、多会话共用，**刻意不删**。
 
 ## 删除范围
@@ -41,7 +41,7 @@
 
 会话 ID 只接受 `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`，`../`、绝对路径、空串一律拒绝。
 
-## 为什么需要墓碑文件（1.3.0）
+## 为什么需要墓碑文件（1.3.0 → 1.3.1）
 
 DSH 没有“销毁会话”的公开 API：`ctx.sessions` 只提供 create/prepare/enter/announce/get/list/fork，唯一能把会话从内存里移除的路径是 `enter()` 返回的 detach 闭包（由 agent-loop 的 teardown 持有，而 API 会话控制器 `resumeObserved` 拿到的 `AgentHandle.dispose` 被丢掉了）。因此**任何在 GUI 里打开过、提问过的会话都会常驻宿主进程直到进程退出**，`session.list` 每次都把它报回来。
 
@@ -58,6 +58,14 @@ DSH 没有“销毁会话”的公开 API：`ctx.sessions` 只提供 create/prep
 - 浏览器半订阅 `sessions.list`，目录每次变化（refresh、重连、宿主推送）后把墓碑 id 用 `handleSessionRemoved()` 再剔除一遍 —— 行不再回来，也不依赖任何视图筛选；
 - 首次访问该接口时，把 `archivedSessionIds` 中“仍存活 + 磁盘日志已不在”的 id 视为 1.2.3 遗留：`unarchiveSession` + 转入墓碑文件（`legacyArchiveSwept` 只做一次），用户不会在“显示已归档”里看到旧灰行；
 - 墓碑随宿主重启自然失效：重启后该 id 既不在内存也不在磁盘，`tombstonesForClient()` 会把它剔除，文件不会无限增长。
+
+1.3.0 上线一段时间后又出现“死灰复活”：删除当下那一行确实不见了，但下一次完整拉取（刷新页面、重连、宿主在别的连接上重算）会从 `session.list` 重新建立基线，浏览器半的订阅剔除只能看见自己观察到的变化，拦不住“从没见过的 pull”。
+
+1.3.1 因此把遮挡点前移到宿主——**列表源头本身**：
+
+- `installCatalogFilter()` 在 `sessionQuery.listSessions` 上包一层（`ApiSessionList.list()` 正是从这里取记录），把墓碑 id 直接从返回结果里滤掉：无论哪个浏览器、刷新多少次、有没有订阅到帧，都不会再列出它；
+- 浏览器半保留 `handleSessionRemoved` 的即时剔除，并额外加了一个 1.5s 的轮询兜底（只在墓碑集非空时干活），避免“订阅没装上 / 帧丢了”这类静默失效；
+- `/session-delete/api/tombstones` 的响应新增 `filter` 字段（`installed` / `wrapped` / `note`），诊断面板会显示宿主过滤与浏览器兜底的实时状态。
 
 ## 安装
 
@@ -89,12 +97,12 @@ git clone https://github.com/LIQiang-IT/dsh-session-delete.git
 ## 测试
 
 ```bash
-node tests/delete-session.test.mjs   # 54 项断言（scratch DSH_HOME，不碰真实数据）
+node tests/delete-session.test.mjs   # 60 项断言（scratch DSH_HOME，不碰真实数据）
 node tests/reload.test.mjs          # 7 项断言
 npm test
 ```
 
-- `tests/delete-session.test.mjs`：非法 id 拒绝、`dryRun` 不落盘且只列出待删任务、5 类磁盘目标删除、注册表清理（unpin → 必要时 unarchive → detach，且断言**从不** archive）、墓碑文件写入、1.2.3 归档墓碑的一次性回收（含“只扫一次”）、定时任务真删、两个 sqlite 的按 id 清理、对照组（keep 会话）全部保留、重复删除幂等。
+- `tests/delete-session.test.mjs`：非法 id 拒绝、`dryRun` 不落盘且只列出待删任务、5 类磁盘目标删除、注册表清理（unpin → 必要时 unarchive → detach，且断言**从不** archive）、墓碑文件写入、1.2.3 归档墓碑的一次性回收（含“只扫一次”）、定时任务真删、两个 sqlite 的按 id 清理、对照组（keep 会话）全部保留、重复删除幂等、以及 1.3.1 的列表过滤器（装入 / 滤掉墓碑 id / 幂等 / 卸载还原 / 服务缺失时的降级）。
 - `tests/reload.test.mjs`：挂载路由、health 初始状态、改文件后自动换模块（`generation` 变 1、`version` 变新值）、无重载错误、卸载释放路由。
 
 测试全部在 `mkdtemp` 出来的临时 `DSH_HOME` 里跑，不读写真机数据。

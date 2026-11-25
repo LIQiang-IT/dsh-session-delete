@@ -5,7 +5,7 @@
 import { mkdtemp, mkdir, writeFile, readFile, readdir, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { admitRequest, deleteSession, tombstonesForClient } from '../index.js'
+import { admitRequest, catalogFilterStatus, deleteSession, installCatalogFilter, tombstonesForClient } from '../index.js'
 
 const sessions = new Set()
 const archived = []
@@ -218,6 +218,26 @@ report(admitRequest(noFence, headersOf({ 'sec-fetch-site': 'same-origin' })) ===
 report(admitRequest(noFence, headersOf({ origin: 'http://127.0.0.1:58663', host: '127.0.0.1:58663' })) === undefined, 'admission: matching Origin/Host is allowed')
 report(admitRequest(noFence, headersOf({ origin: 'https://evil.example', host: '127.0.0.1:58663' })) !== undefined, 'admission: foreign Origin is refused')
 report(admitRequest(noFence, headersOf({ origin: 'null' })) === undefined, 'admission: opaque Origin is left to the Host fence')
+
+// 7. Catalog filter: the Host's own listing must never return a tombstoned id.
+const listed = [
+	{ header: { id }, live: true, persisted: false },
+	{ header: { id: keep }, live: true, persisted: false },
+]
+let listCalls = 0
+const queryService = { listSessions: async () => { listCalls += 1; return listed.slice() } }
+const filterCtx = { get: (name) => (name === 'sessionQuery' ? queryService : undefined) }
+const uninstall = installCatalogFilter(filterCtx)
+report(catalogFilterStatus().installed === true, 'catalog filter installs on the listing source')
+const filtered = await queryService.listSessions()
+report(filtered.length === 1 && filtered[0].header.id === keep, 'listing omits the tombstoned Session', JSON.stringify(filtered.map(r => r.header.id)))
+report(listCalls === 1, 'the filtered listing still delegates once', String(listCalls))
+installCatalogFilter(filterCtx)
+report(catalogFilterStatus().wrapped === 1, 'installing twice does not wrap twice', String(catalogFilterStatus().wrapped))
+uninstall()
+report(catalogFilterStatus().installed === false && (await queryService.listSessions()).length === 2, 'uninstall restores the original listing')
+installCatalogFilter({ get: () => undefined })
+report(catalogFilterStatus().installed === false && /unavailable/.test(catalogFilterStatus().note), 'filter reports a missing Session query service', catalogFilterStatus().note)
 
 console.log(`\nscratch home: ${home}`)
 console.log(`remaining sessions: ${JSON.stringify(await readdir(join(home, 'sessions')))}`)

@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-delete",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "type": "module",
   "description": "DeepSeek Harness plugin: adds a permanent \"Delete session\" action after \"Archive session\", removing every artifact the Host stores for that session.",
   "license": "MIT",

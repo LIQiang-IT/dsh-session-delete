@@ -10,9 +10,10 @@
  *
  * The Host keeps an opened Session resident until the process restarts, so no
  * amount of disk cleanup removes it from `session.list`. The plugin therefore
- * records the deleted id in its own tombstone file; the client half reads that
- * file and keeps the row out of the browser catalog, which hides it in every
- * archive filter instead of turning it into a permanent "archived" row.
+ * records the deleted id in its own tombstone file and filters that id out of
+ * `sessionQuery.listSessions` — the source every catalog pull is built from —
+ * so no browser, reload or reconnect can list the row again. The client half
+ * additionally drops the row it still had on screen.
  */
 import { statSync, watch } from 'node:fs'
 import { lstat, mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
@@ -22,7 +23,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 export const name = 'dsh-session-delete'
 export const inject = ['webServer', 'tools']
 
-export const VERSION = '1.3.0'
+export const VERSION = '1.3.1'
 const ROUTE = '/session-delete'
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
 const MAX_BODY_BYTES = 64 * 1024
@@ -239,6 +240,101 @@ async function sweepLegacyArchive(ctx, home, state, notes) {
 	return cleared
 }
 
+/** Last tombstone read, keyed by the file's identity so listings stay cheap. */
+let tombstoneCache = { file: null, mtimeMs: -1, size: -1, readAt: 0, ids: new Set() }
+
+/** Tombstoned ids, re-read at most every two seconds and on every file change. */
+async function hiddenSessionIds(ctx) {
+	const home = knownHome ?? (await resolveHome(ctx))
+	const file = tombstoneFile(home)
+	const info = statSync(file, { throwIfNoEntry: false })
+	const fresh = tombstoneCache.file === file
+		&& info !== undefined
+		&& tombstoneCache.mtimeMs === info.mtimeMs
+		&& tombstoneCache.size === info.size
+		&& Date.now() - tombstoneCache.readAt < 2000
+	if (fresh) return tombstoneCache.ids
+	let ids = new Set()
+	if (info !== undefined) {
+		const state = await readTombstoneState(home)
+		ids = new Set(state.entries.map(entry => entry.sessionId))
+	}
+	tombstoneCache = {
+		file,
+		mtimeMs: info === undefined ? -1 : info.mtimeMs,
+		size: info === undefined ? -1 : info.size,
+		readAt: Date.now(),
+		ids,
+	}
+	return ids
+}
+
+const catalogFilter = { installed: false, wrapped: 0, note: '' }
+
+/** Public view of the catalog filter, for the health/diagnose payloads. */
+export function catalogFilterStatus() {
+	return { installed: catalogFilter.installed, wrapped: catalogFilter.wrapped, note: catalogFilter.note }
+}
+
+/**
+ * Keep tombstoned ids out of the Host's own Session listing.
+ *
+ * The client half can drop a row from its catalog, but every fresh
+ * `session.list` call re-baselines from the Host — and a Session the Host still
+ * holds resident is listed forever. Filtering the listing at its single source
+ * (`sessionQuery.listSessions`, which `ApiSessionList.list()` uses) means no
+ * pull, in any browser and after any reload, can bring the row back.
+ */
+export function installCatalogFilter(ctx) {
+	let query
+	try {
+		query = ctx.get('sessionQuery')
+	} catch {
+		query = undefined
+	}
+	if (query === undefined || typeof query.listSessions !== 'function') {
+		catalogFilter.installed = false
+		catalogFilter.note = 'sessionQuery service is unavailable'
+		return () => {}
+	}
+	const original = query.listSessions
+	if (original.__dshSessionDeleteFiltered === true) {
+		catalogFilter.installed = true
+		catalogFilter.note = ''
+		return () => {}
+	}
+	const filtered = async function (signal) {
+		const records = await original.call(this, signal)
+		let hidden
+		try {
+			hidden = await hiddenSessionIds(ctx)
+		} catch {
+			return records
+		}
+		if (hidden.size === 0) return records
+		const kept = records.filter(record => !hidden.has(record?.header?.id))
+		return kept.length === records.length ? records : kept
+	}
+	filtered.__dshSessionDeleteFiltered = true
+	try {
+		query.listSessions = filtered
+	} catch (error) {
+		catalogFilter.installed = false
+		catalogFilter.note = `sessionQuery.listSessions is not writable: ${errorMessage(error)}`
+		return () => {}
+	}
+	catalogFilter.installed = true
+	catalogFilter.note = ''
+	catalogFilter.wrapped += 1
+	return () => {
+		if (query.listSessions === filtered) {
+			query.listSessions = original
+			catalogFilter.installed = false
+			catalogFilter.wrapped = Math.max(0, catalogFilter.wrapped - 1)
+		}
+	}
+}
+
 /** Tombstone payload the browser half polls to keep deleted rows out of the catalog. */
 export async function tombstonesForClient(ctx) {
 	const notes = []
@@ -252,6 +348,7 @@ export async function tombstonesForClient(ctx) {
 		count: pruned.entries.length,
 		ids: pruned.entries.map(entry => entry.sessionId),
 		unarchived,
+		filter: catalogFilterStatus(),
 		notes,
 	}
 }
@@ -880,4 +977,14 @@ export function apply(ctx) {
 	}
 
 	watchHostModule(ctx, status)
+
+	// The Host's listing is the single source every catalog pull re-baselines
+	// from, so filter it there: a deleted Session must not be listable at all.
+	if (typeof ctx.inject === 'function') {
+		ctx.inject(['sessionQuery'], (child) => {
+			child.effect(() => installCatalogFilter(child), 'dsh-session-delete: catalog filter')
+		})
+	} else {
+		ctx.effect(() => installCatalogFilter(ctx), 'dsh-session-delete: catalog filter')
+	}
 }
